@@ -53,7 +53,11 @@ public final class MetalPlayView: UIView, VideoOutput {
         }
     }
 
-    public private(set) var pixelBuffer: PixelBufferProtocol?
+    private var lockedPixelBuffer: PixelBufferProtocol?
+    public private(set) var pixelBuffer: PixelBufferProtocol? {
+        get { pixelBufferLock.lock(); defer { pixelBufferLock.unlock() }; return lockedPixelBuffer }
+        set { pixelBufferLock.lock(); lockedPixelBuffer = newValue; pixelBufferLock.unlock() }
+    }
     /// 用displayLink会导致锁屏无法draw，
     /// 用DispatchSourceTimer的话，在播放4k视频的时候repeat的时间会变长,
     /// 用MTKView的draw(in:)也是不行，会卡顿
@@ -70,6 +74,17 @@ public final class MetalPlayView: UIView, VideoOutput {
 
     private let metalView = MetalView()
     public weak var displayLayerDelegate: DisplayLayerDelegate?
+    // LemmePlay (4.5): on the display-layer path, frames are picked and handed to the
+    // layer on a thread of their own, so a busy main thread no longer delays them. Changes to
+    // views (the first frame, a new format or frame rate) still happen on the main thread.
+    private var renderThread: VideoRenderThread?
+    private let renderLock = NSLock()
+    private let pixelBufferLock = NSLock()
+    private var mainSetupPending = false
+    private var fastLayer: AVSampleBufferDisplayLayer?
+    private var fastFormat: CMFormatDescription?
+    private var fastFps: Float = 0
+    private var fastIsDovi = false
     public init(options: KSOptions) {
         self.options = options
         super.init(frame: .zero)
@@ -78,8 +93,14 @@ public final class MetalPlayView: UIView, VideoOutput {
         metalView.isHidden = true
         //        displayLink = CADisplayLink(block: renderFrame)
         displayLink = CADisplayLink(target: self, selector: #selector(renderFrame))
-        // 一定要用common。不然在视频上面操作view的话，那就会卡顿了。
-        displayLink.add(to: .main, forMode: .common)
+        if options.isUseDisplayLayer() {
+            let thread = VideoRenderThread()
+            renderThread = thread
+            thread.add(displayLink)
+        } else {
+            // 一定要用common。不然在视频上面操作view的话，那就会卡顿了。
+            displayLink.add(to: .main, forMode: .common)
+        }
         pause()
     }
 
@@ -151,7 +172,12 @@ public final class MetalPlayView: UIView, VideoOutput {
     }
 
     public func invalidate() {
-        displayLink.invalidate()
+        if let renderThread {
+            self.renderThread = nil
+            renderThread.stop(displayLink)
+        } else {
+            displayLink.invalidate()
+        }
     }
 
     public func readNextFrame() {
@@ -165,14 +191,54 @@ public final class MetalPlayView: UIView, VideoOutput {
 
 extension MetalPlayView {
     @objc private func renderFrame() {
-        draw(force: false)
+        if Thread.isMainThread {
+            draw(force: false)
+        } else {
+            drawOffMain()
+        }
     }
 
     private func draw(force: Bool) {
+        renderLock.lock()
+        let frame = renderSource?.getVideoOutputRender(force: force)
+        renderLock.unlock()
+        if let frame {
+            show(frame)
+        }
+    }
+
+    /// The display link's thread: a frame that fits what the main thread last set up goes
+    /// straight to the layer; anything else is shown by the main thread, and frames wait for it.
+    private func drawOffMain() {
         autoreleasepool {
-            guard let frame = renderSource?.getVideoOutputRender(force: force) else {
+            renderLock.lock()
+            guard !mainSetupPending, let frame = renderSource?.getVideoOutputRender(force: false) else {
+                renderLock.unlock()
                 return
             }
+            guard let core = frame.corePixelBuffer, let imageBuffer = core.cvPixelBuffer,
+                  let layer = fastLayer, let format = fastFormat,
+                  frame.fps == fastFps, frame.isDovi == fastIsDovi,
+                  options.customizeDar(sar: core.aspectRatio, par: core.size) == nil,
+                  core.matche(formatDescription: format)
+            else {
+                mainSetupPending = true
+                renderLock.unlock()
+                DispatchQueue.main.async { [weak self] in
+                    self?.show(frame)
+                }
+                return
+            }
+            renderLock.unlock()
+            pixelBuffer = core
+            AVSampleBufferDisplayView.enqueue(on: layer, imageBuffer: imageBuffer, formatDescription: format, time: frame.cmtime)
+            renderSource?.setVideo(time: frame.cmtime, position: frame.position)
+        }
+    }
+
+    /// On the main thread.
+    private func show(_ frame: VideoVTBFrame) {
+        autoreleasepool {
             pixelBuffer = frame.corePixelBuffer
             guard let pixelBuffer else {
                 return
@@ -219,6 +285,18 @@ extension MetalPlayView {
             }
             renderSource?.setVideo(time: cmtime, position: frame.position)
         }
+        guard renderThread != nil else { return }
+        renderLock.lock()
+        if options.isUseDisplayLayer(), !displayView.isHidden, let formatDescription {
+            fastLayer = displayView.displayLayer
+            fastFormat = formatDescription
+            fastFps = fps
+            fastIsDovi = isDovi
+        } else {
+            fastLayer = nil
+        }
+        mainSetupPending = false
+        renderLock.unlock()
     }
 
     private func checkFormatDescription(pixelBuffer: PixelBufferProtocol) {
@@ -331,6 +409,11 @@ class AVSampleBufferDisplayView: UIView {
     }
 
     func enqueue(imageBuffer: CVPixelBuffer, formatDescription: CMVideoFormatDescription, time: CMTime) {
+        Self.enqueue(on: displayLayer, imageBuffer: imageBuffer, formatDescription: formatDescription, time: time)
+    }
+
+    /// Callable from any thread: the layer takes frames from any.
+    static func enqueue(on displayLayer: AVSampleBufferDisplayLayer, imageBuffer: CVPixelBuffer, formatDescription: CMVideoFormatDescription, time: CMTime) {
         let timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
         //        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: time, decodeTimeStamp: .invalid)
         var sampleBuffer: CMSampleBuffer?
@@ -359,6 +442,45 @@ class AVSampleBufferDisplayView: UIView {
                 //                    }
             }
         }
+    }
+}
+
+// LemmePlay (4.5): the run loop the display-layer path's display link fires on.
+private final class VideoRenderThread: Thread {
+    private let started = DispatchSemaphore(value: 0)
+
+    override init() {
+        super.init()
+        name = "KSPlayer video"
+        qualityOfService = .userInteractive
+        start()
+        started.wait()
+    }
+
+    override func main() {
+        RunLoop.current.add(NSMachPort(), forMode: .default)
+        started.signal()
+        while !isCancelled {
+            _ = RunLoop.current.run(mode: .default, before: .distantFuture)
+        }
+    }
+
+    func add(_ link: CADisplayLink) {
+        perform(#selector(schedule(_:)), on: self, with: link, waitUntilDone: true)
+    }
+
+    func stop(_ link: CADisplayLink) {
+        perform(#selector(finish(_:)), on: self, with: link, waitUntilDone: true)
+    }
+
+    // `Any`: on macOS KSPlayer's CADisplayLink is a Swift class.
+    @objc private func schedule(_ link: Any) {
+        (link as? CADisplayLink)?.add(to: .current, forMode: .common)
+    }
+
+    @objc private func finish(_ link: Any) {
+        (link as? CADisplayLink)?.invalidate()
+        cancel()
     }
 }
 
