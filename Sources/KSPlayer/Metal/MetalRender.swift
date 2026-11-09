@@ -109,8 +109,13 @@ class MetalRender {
         encoder.popDebugGroup()
         encoder.endEncoding()
         commandBuffer.present(drawable)
+        // The frame and its textures are held until the GPU has read them, so the decoder can't
+        // reuse their memory too early, rather than the main thread waiting for the GPU at every
+        // frame: about 2 ms a frame, and 200-600 ms for the first frames after launch.
+        commandBuffer.addCompletedHandler { _ in
+            withExtendedLifetime((pixelBuffer, inputTextures)) {}
+        }
         commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
     }
 
     private func setFragmentBuffer(pixelBuffer: PixelBufferProtocol, encoder: MTLRenderCommandEncoder) {
