@@ -63,8 +63,28 @@ public final class MetalPlayView: UIView, VideoOutput {
     /// 用MTKView的draw(in:)也是不行，会卡顿
     private var displayLink: CADisplayLink!
 //    private let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
-    public var options: KSOptions
-    public weak var renderSource: OutputRenderSourceDelegate?
+    // LemmePlay (4.5): the render thread reads these while the main thread changes them at every
+    // stream change, so both sit behind the render lock. Code already holding it reads the stored
+    // values (the lock isn't reentrant).
+    public var options: KSOptions {
+        get { renderLock.lock(); defer { renderLock.unlock() }; return lockedOptions }
+        set { renderLock.lock(); lockedOptions = newValue; renderLock.unlock() }
+    }
+
+    public var renderSource: OutputRenderSourceDelegate? {
+        get { renderLock.lock(); defer { renderLock.unlock() }; return lockedRenderSource }
+        set {
+            renderLock.lock()
+            lockedRenderSource = newValue
+            // A frame queued for the main thread belongs to the stream it came from.
+            queuedFrameGeneration += 1
+            mainSetupPending = false
+            renderLock.unlock()
+        }
+    }
+
+    private var lockedOptions: KSOptions
+    private weak var lockedRenderSource: OutputRenderSourceDelegate?
     // AVSampleBufferAudioRenderer AVSampleBufferRenderSynchronizer AVSampleBufferDisplayLayer
     var displayView = AVSampleBufferDisplayView() {
         didSet {
@@ -81,12 +101,14 @@ public final class MetalPlayView: UIView, VideoOutput {
     private let renderLock = NSLock()
     private let pixelBufferLock = NSLock()
     private var mainSetupPending = false
+    /// Moves on when the stream changes or the picture is flushed; a frame queued before is dropped.
+    private var queuedFrameGeneration = 0
     private var fastLayer: AVSampleBufferDisplayLayer?
     private var fastFormat: CMFormatDescription?
     private var fastFps: Float = 0
     private var fastIsDovi = false
     public init(options: KSOptions) {
-        self.options = options
+        lockedOptions = options
         super.init(frame: .zero)
         addSubview(displayView)
         addSubview(metalView)
@@ -163,6 +185,7 @@ public final class MetalPlayView: UIView, VideoOutput {
     #endif
 
     public func flush() {
+        invalidateQueuedFrames()
         pixelBuffer = nil
         if displayView.isHidden {
             metalView.clear()
@@ -200,7 +223,7 @@ extension MetalPlayView {
 
     private func draw(force: Bool) {
         renderLock.lock()
-        let frame = renderSource?.getVideoOutputRender(force: force)
+        let frame = lockedRenderSource?.getVideoOutputRender(force: force)
         renderLock.unlock()
         if let frame {
             show(frame)
@@ -212,27 +235,35 @@ extension MetalPlayView {
     private func drawOffMain() {
         autoreleasepool {
             renderLock.lock()
-            guard !mainSetupPending, let frame = renderSource?.getVideoOutputRender(force: false) else {
+            guard !mainSetupPending, let frame = lockedRenderSource?.getVideoOutputRender(force: false) else {
                 renderLock.unlock()
                 return
             }
             guard let core = frame.corePixelBuffer, let imageBuffer = core.cvPixelBuffer,
                   let layer = fastLayer, let format = fastFormat,
                   frame.fps == fastFps, frame.isDovi == fastIsDovi,
-                  options.customizeDar(sar: core.aspectRatio, par: core.size) == nil,
+                  lockedOptions.customizeDar(sar: core.aspectRatio, par: core.size) == nil,
                   core.matche(formatDescription: format)
             else {
                 mainSetupPending = true
+                let generation = queuedFrameGeneration
                 renderLock.unlock()
                 DispatchQueue.main.async { [weak self] in
-                    self?.show(frame)
+                    guard let self else { return }
+                    // Not after the stream changed: its picture, and its time given to the next one.
+                    self.renderLock.lock()
+                    let isCurrent = generation == self.queuedFrameGeneration
+                    self.renderLock.unlock()
+                    if isCurrent { self.show(frame) }
                 }
                 return
             }
-            renderLock.unlock()
+            // Still under the lock: a stream change or a flush waits for this frame, so it neither
+            // shows after them nor gives its time to the next stream.
             pixelBuffer = core
             AVSampleBufferDisplayView.enqueue(on: layer, imageBuffer: imageBuffer, formatDescription: format, time: frame.cmtime)
-            renderSource?.setVideo(time: frame.cmtime, position: frame.position)
+            lockedRenderSource?.setVideo(time: frame.cmtime, position: frame.position)
+            renderLock.unlock()
         }
     }
 
@@ -283,11 +314,14 @@ extension MetalPlayView {
                 #endif
                 metalView.draw(pixelBuffer: pixelBuffer, display: options.display, size: size)
             }
-            renderSource?.setVideo(time: cmtime, position: frame.position)
+            // One thread at a time sets the video clock, the render thread doing so too.
+            renderLock.lock()
+            lockedRenderSource?.setVideo(time: cmtime, position: frame.position)
+            renderLock.unlock()
         }
         guard renderThread != nil else { return }
         renderLock.lock()
-        if options.isUseDisplayLayer(), !displayView.isHidden, let formatDescription {
+        if lockedOptions.isUseDisplayLayer(), !displayView.isHidden, let formatDescription {
             fastLayer = displayView.displayLayer
             fastFormat = formatDescription
             fastFps = fps
@@ -295,6 +329,13 @@ extension MetalPlayView {
         } else {
             fastLayer = nil
         }
+        mainSetupPending = false
+        renderLock.unlock()
+    }
+
+    private func invalidateQueuedFrames() {
+        renderLock.lock()
+        queuedFrameGeneration += 1
         mainSetupPending = false
         renderLock.unlock()
     }
