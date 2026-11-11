@@ -26,8 +26,20 @@ public final class MEPlayerItem: Sendable {
     private var seekingCompletionHandler: ((Bool) -> Void)?
     // 没有音频数据可以渲染
     private var isAudioStalled = true
-    private var audioClock = KSClock()
-    private var videoClock = KSClock()
+    // LemmePlay (4.5): the display-layer path's render thread reads the clocks for every frame
+    // while the main thread sets them; one lock keeps each read and each update whole.
+    private let clockLock = NSLock()
+    private var lockedAudioClock = KSClock()
+    private var lockedVideoClock = KSClock()
+    private var audioClock: KSClock {
+        get { clockLock.lock(); defer { clockLock.unlock() }; return lockedAudioClock }
+        set { clockLock.lock(); lockedAudioClock = newValue; clockLock.unlock() }
+    }
+
+    private var videoClock: KSClock {
+        get { clockLock.lock(); defer { clockLock.unlock() }; return lockedVideoClock }
+        set { clockLock.lock(); lockedVideoClock = newValue; clockLock.unlock() }
+    }
     private var isFirst = true
     private var isSeek = false
     private var allPlayerItemTracks = [PlayerItemTrackProtocol]()
@@ -834,13 +846,17 @@ extension MEPlayerItem: CodecCapacityDelegate {
 
 extension MEPlayerItem: OutputRenderSourceDelegate {
     func mainClock() -> KSClock {
-        isAudioStalled ? videoClock : audioClock
+        clockLock.lock()
+        defer { clockLock.unlock() }
+        return isAudioStalled ? lockedVideoClock : lockedAudioClock
     }
 
     public func setVideo(time: CMTime, position: Int64) {
 //        print("[video] video interval \(CACurrentMediaTime() - videoClock.lastMediaTime) video diff \(time.seconds - videoClock.time.seconds)")
-        videoClock.time = time
-        videoClock.position = position
+        clockLock.lock()
+        lockedVideoClock.time = time
+        lockedVideoClock.position = position
+        clockLock.unlock()
         videoDisplayCount += 1
         let diff = videoClock.lastMediaTime - lastVideoDisplayTime
         if diff > 1 {
@@ -854,8 +870,10 @@ extension MEPlayerItem: OutputRenderSourceDelegate {
 //        print("[audio] setAudio: \(time.seconds)")
         // 切换到主线程的话，那播放起来会更顺滑
         runOnMainThread {
-            self.audioClock.time = time
-            self.audioClock.position = position
+            self.clockLock.lock()
+            self.lockedAudioClock.time = time
+            self.lockedAudioClock.position = position
+            self.clockLock.unlock()
         }
     }
 
